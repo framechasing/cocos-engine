@@ -23,6 +23,71 @@
  THE SOFTWARE.
 */
 
+// ---------------------------------------------------------------------------
+// SORTING2D PATCH. This file is 3.5.2's original
+// cocos/2d/renderer/batcher-2d.ts with a collect->sort->emit path added,
+// backported from 3.8.8's batcher-2d.ts (lines ~56-68, ~870-980 there).
+// Search "SORTING2D PATCH" for every changed spot; everything else is
+// untouched. High-level summary of what changed and why:
+//
+//   - walk() emits immediately today (updateAssembler + postUpdateAssembler
+//     called inline, in tree order). When BackportSorting2D is active, renderers
+//     (masks included) are recorded into a queue instead of emitted
+//     immediately; the queue is sorted by `.priority` and drained at
+//     well-defined flush points instead.
+//   - Flush points: end of each screen's walk in update() (3.8.8 parity),
+//     and around every Mask node (see below) so sorting never reorders
+//     content across a mask boundary.
+//
+// MASK HANDLING - MIRRORS 3.8.8, WITH ONE 3.5.2-SPECIFIC TRANSLATION:
+// 3.8.8 detects a mask boundary via `render.stencilStage === Stage.ENTER_LEVEL`.
+// That works there because the mask's stencil-setup renderer is a Sprite or
+// Graphics sub-component living ON the mask node (walk() sees it as uiComp)
+// whose stencilStage holds ENTER_LEVEL persistently. In 3.5.2 the Mask
+// component is itself the Renderable2D, and ENTER_LEVEL only ever appears
+// transiently on the internal delegate `mask.graphics` - the literal 3.8.8
+// check never fires here. This patch uses `render instanceof Mask &&
+// render.enabledInHierarchy` as the equivalent boundary test (a disabled
+// mask's sub-renderer is DISABLED/absent in 3.8.8, so no boundary there
+// either).
+//
+// Beyond that translation the flow is 3.8.8's walk() (their batcher-2d.ts
+// lines ~906-980), step for step:
+//   1. On reaching a mask node: flush the recorded queue, then close the open
+//      batch (autoMergeBatches + resetRenderStates).   [3.8.8 lines 930-936]
+//   2. Record the mask itself into the now-empty queue like any renderer, so
+//      its stencil-setup draw SORTS TOGETHER WITH ITS CHILDREN by priority
+//      (the mask holds the default priority unless a BackportSorting2D sits on its
+//      node).                                          [3.8.8 line 937]
+//   3. Children are recorded into that same queue.
+//   4. After the subtree: flush (emits mask setup + children as one sorted
+//      group), then pop the stencil level.             [3.8.8 lines 962-976]
+// The stencil pop differs mechanically: 3.8.8's walk() calls
+// StencilManager.exitMask() directly; in 3.5.2 the pop lives in
+// Mask.postUpdateAssembler (maskEndAssembler), so walk() calls that at the
+// same point in the flow - and the flush loop must therefore NOT call
+// postUpdateAssembler on a Mask (in 3.8.8 the flushed entry is the
+// sub-renderer, whose post-assembler carries no mask-exit logic).
+//
+// Inherited 3.8.8 quirk, kept deliberately for parity: a child sorted BELOW
+// the mask's own priority (lower layer, or negative sortingOrder on the
+// default layer) emits before the stencil-setup draw and renders effectively
+// unmasked - upstream 3.8.8 behaves the same way. A Mask's position relative
+// to its own siblings is not sortable via BackportSorting2D (the boundary flushes
+// bracket it), also same as upstream.
+//
+// This has NOT been run against a real scene with Mask + BackportSorting2D siblings.
+// Test that combination before relying on it.
+//
+// KNOWN UPSTREAM BUG, FIXED HERE (found 2026-07-06): uiComp is not always a
+// Renderable2D - UIMeshRenderer (3D ParticleSystem/MeshRenderer content in UI)
+// registers as uiComp yet has no `priority`, in 3.8.8 exactly as here; the flush
+// comparator then returns NaN and the queue comes out partially unsorted (one
+// particle-in-UI node scrambles its whole flush group). Upstream 3.8.8 has this
+// bug; this backport does not: the flush comparator falls back to
+// BackportSortingLayers.getDefaultPriority() for recorded entries without `priority`.
+// ---------------------------------------------------------------------------
+
 import { JSB } from 'internal:constants';
 import { Camera, Model } from 'cocos/core/renderer/scene';
 import type { UIStaticBatch } from '../components/ui-static-batch';
@@ -48,9 +113,38 @@ import { getAttributeStride, vfmtPosUvColor } from './vertex-format';
 import { updateOpacity } from '../assembler/utils';
 import { BaseRenderData, MeshRenderData } from './render-data';
 import { UIMeshRenderer } from '../components/ui-mesh-renderer';
+// SORTING2D PATCH: new imports.
+import { RecyclePool } from '../../core/memop/recycle-pool';
+import { Mask } from '../components/mask';
+import { USE_BACKPORT_SORTING_2D } from '../../sorting/backport-sorting-2d-flag';
+// SORTING2D PATCH: import for the comparator's default-priority fallback.
+import { BackportSortingLayers } from '../../sorting/backport-sorting-layers';
 
 const _dsInfo = new DescriptorSetInfo(null!);
 const m4_1 = new Mat4();
+
+// SORTING2D PATCH: module state + record/flush infrastructure, backported from
+// 3.8.8 batcher-2d.ts lines ~56-82.
+let backportSorting2DCount = 0;
+
+/**
+ * @engineInternal
+ */
+export function _setBackportSorting2DCount (v: number): void {
+    backportSorting2DCount = v;
+}
+
+interface RecordedRendererInfo {
+    renderer: Renderable2D | null;
+    finalOpacity: number; // float
+    opacityDirty: boolean;
+}
+
+const recordedRendererInfoPool = new RecyclePool<RecordedRendererInfo>(() => ({
+    renderer: null,
+    finalOpacity: 0,
+    opacityDirty: false,
+}), 128);
 
 /**
  * @zh
@@ -109,6 +203,9 @@ export class Batcher2D implements IBatcher {
 
     private _meshDataArray :MeshRenderData[] = [];
 
+    // SORTING2D PATCH
+    private _recordedRendererInfoQueue: RecordedRendererInfo[] = [];
+
     constructor (private _root: Root) {
         this.device = _root.device;
         this._batches = new CachedArray(64);
@@ -120,6 +217,9 @@ export class Batcher2D implements IBatcher {
     }
 
     public destroy () {
+        // SORTING2D PATCH
+        this._recordedRendererInfoQueue.length = 0;
+
         for (let i = 0; i < this._batches.length; i++) {
             if (this._batches.array[i]) {
                 this._batches.array[i].destroy(this);
@@ -202,6 +302,13 @@ export class Batcher2D implements IBatcher {
             this._opacityDirty = 0;
             this._pOpacity = 1;
             this.walk(screen.node);
+
+            // SORTING2D PATCH: drain anything left recorded for this screen (e.g. trailing
+            // siblings after the last mask boundary, or the whole screen if no masks at all).
+            if (USE_BACKPORT_SORTING_2D && backportSorting2DCount > 0) {
+                this._flushRecordedUIRenderers();
+            }
+
             this.autoMergeBatches(this._currComponent!);
             this.resetRenderStates();
 
@@ -221,6 +328,11 @@ export class Batcher2D implements IBatcher {
                     scene.addBatch(batch);
                 }
             }
+        }
+
+        // SORTING2D PATCH
+        if (USE_BACKPORT_SORTING_2D && backportSorting2DCount > 0) {
+            recordedRendererInfoPool.reset();
         }
     }
 
@@ -637,6 +749,78 @@ export class Batcher2D implements IBatcher {
         this._currMaterial = mat;
     }
 
+    // SORTING2D PATCH: everything below this point, down to _screenSort, is new
+    // (_handleUIRenderer / _recordUIRenderer / _flushRecordedUIRenderers), or a
+    // modified walk() - see the file header for the overall design.
+
+    /**
+     * The pre-3.5.2-patch immediate-emit body: update the assembler and push the
+     * cascaded opacity to the vertex buffer. Called either immediately from walk()
+     * (BackportSorting2D inactive) or from the flush loop below (recorded, sorted content).
+     */
+    private _handleUIRenderer (render: Renderable2D, finalOpacity: number, opacityDirty: boolean) {
+        if (render.enabledInHierarchy) {
+            render.updateAssembler(this);
+        }
+
+        if (opacityDirty && !render.useVertexOpacity && render.renderData && render.renderData.vertexCount > 0) {
+            // HARD COUPLING
+            updateOpacity(render.renderData, finalOpacity);
+            const buffer = render.renderData.getMeshBuffer();
+            if (buffer) {
+                buffer.setDirty();
+            }
+        }
+    }
+
+    private _recordUIRenderer (render: Renderable2D, finalOpacity: number, opacityDirty: boolean): void {
+        const info = recordedRendererInfoPool.add();
+        info.renderer = render;
+        info.finalOpacity = finalOpacity;
+        info.opacityDirty = opacityDirty;
+        this._recordedRendererInfoQueue.push(info);
+    }
+
+    private _flushRecordedUIRenderers (): void {
+        const queue = this._recordedRendererInfoQueue;
+        const length = queue.length;
+        if (length === 0) return;
+
+        // SORTING2D PATCH: recorded uiComps that are not Renderable2D
+        // (UIMeshRenderer, legacy UIComponent subclasses) have no `priority`;
+        // treat them as default priority instead of letting NaN corrupt the
+        // sort - see the KNOWN UPSTREAM BUG note in the file header.
+        const defaultPriority = BackportSortingLayers.getDefaultPriority();
+        queue.sort((a, b) => {
+            const pa = (a.renderer! as Partial<Renderable2D>).priority;
+            const pb = (b.renderer! as Partial<Renderable2D>).priority;
+            return (pa === undefined ? defaultPriority : pa) - (pb === undefined ? defaultPriority : pb);
+        });
+
+        for (let i = 0; i < length; i++) {
+            const info = queue[i];
+            const render = info.renderer;
+
+            if (render) {
+                this._handleUIRenderer(render, info.finalOpacity, info.opacityDirty);
+                // Masks are excluded here: 3.5.2's Mask.postUpdateAssembler IS the
+                // stencil pop (maskEndAssembler -> exitMask), and firing it at the
+                // mask's sorted position would pop before its children emit. walk()
+                // calls it right after this flush instead - the same point where
+                // 3.8.8's walk() calls StencilManager.exitMask() directly (their
+                // flushed entry is the mask's sub-renderer, whose post-assembler
+                // has no mask-exit logic, so their loop can call it untyped).
+                if (render.enabledInHierarchy && !(render instanceof Mask)) {
+                    render.postUpdateAssembler(this);
+                }
+            }
+            info.renderer = null;
+            info.finalOpacity = 1;
+            info.opacityDirty = false;
+        }
+        queue.length = 0;
+    }
+
     public walk (node: Node, level = 0) {
         if (!node.activeInHierarchy) {
             return;
@@ -659,18 +843,24 @@ export class Batcher2D implements IBatcher {
             this._opacityDirty++;
         }
 
-        // Render assembler update logic
-        if (render && render.enabledInHierarchy) {
-            render.updateAssembler(this);
-        }
+        // SORTING2D PATCH: mirrors 3.8.8 walk() (their batcher-2d.ts ~930-940).
+        // An enabled Mask is a hard sorting boundary: drain everything recorded
+        // before it and close the open batch, then record the mask itself into the
+        // now-empty queue so its stencil-setup draw sorts together with its
+        // children in the exit flush below - see file header.
+        const isMaskNode = !!render && render instanceof Mask;
+        const sortingActive = USE_BACKPORT_SORTING_2D && backportSorting2DCount > 0;
+        if (render) {
+            if (sortingActive) {
+                if (isMaskNode && render.enabledInHierarchy) {
+                    this._flushRecordedUIRenderers();
 
-        // Update cascaded opacity to vertex buffer
-        if (this._opacityDirty && render && !render.useVertexOpacity && render.renderData && render.renderData.vertexCount > 0) {
-            // HARD COUPLING
-            updateOpacity(render.renderData, opacity);
-            const buffer = render.renderData.getMeshBuffer();
-            if (buffer) {
-                buffer.setDirty();
+                    this.autoMergeBatches(this._currComponent!);
+                    this.resetRenderStates();
+                }
+                this._recordUIRenderer(render, opacity, !!this._opacityDirty);
+            } else {
+                this._handleUIRenderer(render, opacity, !!this._opacityDirty);
             }
         }
 
@@ -692,7 +882,17 @@ export class Batcher2D implements IBatcher {
         // Post render assembler update logic
         // ATTENTION: Will also reset colorDirty inside postUpdateAssembler
         if (render && render.enabledInHierarchy) {
-            render.postUpdateAssembler(this);
+            if (sortingActive && isMaskNode) {
+                // 3.8.8 walk() lines ~966-968: emit the mask's stencil-setup draw and
+                // its children as ONE sorted group, THEN pop the stencil level via
+                // postUpdateAssembler below (3.5.2's equivalent of 3.8.8 calling
+                // StencilManager.exitMask() directly at this same point).
+                this._flushRecordedUIRenderers();
+            }
+            if (!sortingActive || isMaskNode) {
+                render.postUpdateAssembler(this);
+            }
+            // else: deferred - called from _flushRecordedUIRenderers() instead.
         }
 
         level += 1;

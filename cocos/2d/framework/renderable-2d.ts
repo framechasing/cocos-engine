@@ -23,6 +23,18 @@
  THE SOFTWARE.
 */
 
+// ---------------------------------------------------------------------------
+// SORTING2D PATCH: this file is 3.5.2's original
+// cocos/2d/framework/renderable-2d.ts with a `priority` field added, mirroring
+// 3.8.8's UIRenderer.priority (cocos/2d/framework/ui-renderer.ts). Everything
+// else is untouched. Search "SORTING2D PATCH" for the two changed spots.
+//
+// Why this file needs to change at all: BackportSorting2D writes to `renderable.priority`,
+// and the batcher (cocos/2d/renderer/batcher-2d.ts) reads it as the sort key. 3.5.2's
+// Renderable2D predates the UIRenderer rename and has no such field —
+// backport-sorting-2d.ts cannot compile against stock 3.5.2 without this addition.
+// ---------------------------------------------------------------------------
+
 import { EDITOR } from 'internal:constants';
 import { ccclass, executeInEditMode, requireComponent, disallowMultiple, tooltip,
     type, displayOrder, serializable, override, visible, displayName, disallowAnimation } from 'cc.decorator';
@@ -42,6 +54,9 @@ import { Stage } from '../renderer/stencil-manager';
 import { warnID } from '../../core/platform/debug';
 import { legacyCC } from '../../core/global-exports';
 import { NodeEventType } from '../../core/scene-graph/node-event';
+// SORTING2D PATCH: new imports for the priority field's default value.
+import { BackportSortingLayers } from '../../sorting/backport-sorting-layers';
+import { USE_BACKPORT_SORTING_2D } from '../../sorting/backport-sorting-2d-flag';
 
 // hack
 ccenum(BlendFactor);
@@ -209,6 +224,29 @@ export class Renderable2D extends RenderableComponent {
      * @zh 组件模板缓冲状态 (注意：请不要直接修改它的值)
      */
     public stencilStage : Stage = Stage.DISABLED;
+
+    // SORTING2D PATCH: priority field, mirrors 3.8.8 UIRenderer.priority (ui-renderer.ts:280-291).
+    // Not @serializable — recomputed at runtime by BackportSorting2D, same as upstream.
+    // 3.8.8's UIRenderer constructor calls `this.priority = SortingLayers.getDefaultPriority()`,
+    // giving every renderer the semantically correct default. 3.5.2's Renderable2D cannot
+    // easily add a constructor override, so the lazy getter below serves as
+    // the functional equivalent: first access defaults to getDefaultPriority(), matching 3.8.8.
+    private _priority = -1;
+
+    /**
+     * @en Render order within a BackportSorting2D layer/sibling group. Consumed by the batcher-2d
+     * patch's sort step; has no effect until that patch and USE_BACKPORT_SORTING_2D are both active.
+     * @zh 用于 BackportSorting2D 排序的渲染优先级，需配合 batcher-2d 补丁生效。
+     */
+    get priority (): number {
+        if (this._priority < 0) {
+            this._priority = USE_BACKPORT_SORTING_2D ? BackportSortingLayers.getDefaultPriority() : 0;
+        }
+        return this._priority;
+    }
+    set priority (val: number) {
+        this._priority = val;
+    }
 
     @serializable
     protected _srcBlendFactor = BlendFactor.SRC_ALPHA;
