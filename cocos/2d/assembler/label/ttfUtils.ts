@@ -485,8 +485,9 @@ export const ttfUtils =  {
         let maxLength = 0;
 
         if (_isWrapText) {
-            const canvasWidthNoMargin = _nodeContentSize.width;
-            const canvasHeightNoMargin = _nodeContentSize.height;
+            // Must match the wrap width in _calculateWrapText.
+            const canvasWidthNoMargin = _nodeContentSize.width - _canvasPadding.width;
+            const canvasHeightNoMargin = _nodeContentSize.height - _canvasPadding.height;
             if (canvasWidthNoMargin < 0 || canvasHeightNoMargin < 0) {
                 return;
             }
@@ -543,7 +544,7 @@ export const ttfUtils =  {
                 }
             }
             const scaleX = (_canvasSize.width - _canvasPadding.width) / maxLength;
-            const scaleY = _canvasSize.height / totalHeight;
+            const scaleY = (_canvasSize.height - _canvasPadding.height) / totalHeight;
 
             _fontSize = (_drawFontsize * Math.min(1, scaleX, scaleY)) | 0;
             _fontDesc = this._getFontDesc();
@@ -555,7 +556,8 @@ export const ttfUtils =  {
         if (!_isWrapText || !_context) return;
 
         _splitStrings = [];
-        const canvasWidthNoMargin = _nodeContentSize.width;
+        // Outline, shadow and italic draw outside the glyphs; wrapping must leave room for them.
+        const canvasWidthNoMargin = _nodeContentSize.width - _canvasPadding.width;
         for (let i = 0; i < paragraphedStrings.length; ++i) {
             const allWidth = safeMeasureText(_context, paragraphedStrings[i], _fontDesc);
             const textFragment = fragmentText(paragraphedStrings[i],
